@@ -10,10 +10,31 @@ permissions:
 jobs:
   full-system-speaker-tone:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 90
     steps:
       - name: Check out x86 backend
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Build and qualify the pinned host C frontend
+        id: ick
+        uses: isomorphisms/ai-ci/ick-host@903b2cb27ea572c9c6cb2ffa9f39e0fbf06ec9f8
+
+      - name: Check out the stage contract
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: isomorphisms/ai-ci
+          ref: 903b2cb27ea572c9c6cb2ffa9f39e0fbf06ec9f8
+          path: .aici-host
+          sparse-checkout: |
+            src/aici.c
+            contracts/build-toolchain-v0.contract.tsv
+          persist-credentials: false
+
+      - name: Verify the declared C compiler stage
+        run: make -f ci/Makefile verify ICK="${{ steps.ick.outputs.compiler }}"
 
       - name: Install guest-build and system-emulation tools
         run: |
@@ -21,11 +42,13 @@ jobs:
           sudo apt-get install -y debootstrap e2fsprogs libasound2-dev qemu-system-x86
 
       - name: Boot Ubuntu and capture native speaker output
+        env:
+          ICK: ${{ steps.ick.outputs.compiler }}
         run: sh examples/speaker-tone/full-system-ubuntu.sh
 
       - name: Retain guest audio receipt
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: full-system-x86-speaker-tone
           path: |
