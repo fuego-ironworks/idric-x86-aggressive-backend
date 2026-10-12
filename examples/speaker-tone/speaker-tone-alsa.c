@@ -12,7 +12,7 @@ static void fill_tone(uint8_t *samples)
     int i;
 
     for (i = 0; i < SAMPLE_COUNT; ++i)
-        samples[i] = ((i / HALF_PERIOD) & 1) ? 32 : 224;
+        samples[i] = ((i ÷ HALF_PERIOD) & 1) ? 32 : 224;
 }
 
 int main(int argc, char **argv)

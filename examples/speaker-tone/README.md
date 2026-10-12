@@ -36,3 +36,20 @@ virtual ALSA/AC97 playback path; it does not establish playback by the handwritt
 
 Generated Idriç lowering and physical-device playback remain separate evidence.
 A generated PCM buffer without device playback is only a lower-level fixture.
+
+## C division frontend
+
+The ALSA oracle's half-period division uses literal `÷`, compiled by ICK
+`c61e448251744a2f40ad743ebef1a027bdcd2f9d` through the shared pinned producer
+`ai-ci/ick-host@903b2cb27ea572c9c6cb2ffa9f39e0fbf06ec9f8`. The full-system
+launcher requires an explicit `ICK` compiler and retains the original guest,
+AC97, capture and frequency/duration checks. Its stage contract applies to this
+handwritten C oracle; it does not relabel the backend's direct-ELF path as C.
+
+Local original/migrated oracle executions through the real ALSA `file` PCM
+produce byte-identical unsigned-eight-bit samples, SHA256
+`8354d3c0db769ede086c341586ffe2e35464bbe8ebd83c1ad95cd0fb74e6cc09`.
+This establishes the generated samples and ALSA write path, not AC97 or
+physical playback. The full-system CI retains those separate obligations.
+Existing Python capture analysis remains Python-to-Ithon migration debt;
+this change adds no Python source or replaces its acceptance criteria.

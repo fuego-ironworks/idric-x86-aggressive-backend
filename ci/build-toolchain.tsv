@@ -1,0 +1,2 @@
+build_id	target	toolchain	ick_revision	ick_status	ick_evidence
+alsa-platform-oracle	linux-x86_64	ick	c61e448251744a2f40ad743ebef1a027bdcd2f9d	qualified	examples/speaker-tone/README.md

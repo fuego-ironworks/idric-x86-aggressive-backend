@@ -7,7 +7,7 @@ repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 UBUNTU_SUITE=${UBUNTU_SUITE:-noble}
 UBUNTU_MIRROR=${UBUNTU_MIRROR:-http://archive.ubuntu.com/ubuntu}
 QEMU=${QEMU:-qemu-system-x86_64}
-CC=${CC:-cc}
+ICK=${ICK:?set ICK to the qualified native ICK compiler}
 
 work=${WORK_DIR:-"$repo_root/build/full-system-x86-speaker"}
 rootfs="$work/rootfs"
@@ -21,14 +21,14 @@ initrd="$work/initrd.img"
 rm -rf "$work"
 mkdir -p "$work"
 
-for command in debootstrap mkfs.ext4 python3 "$QEMU" "$CC"; do
+for command in debootstrap mkfs.ext4 python3 "$QEMU" "$ICK"; do
     command -v "$command" >/dev/null 2>&1 || {
         printf 'FAIL: required command not found: %s\n' "$command" >&2
         exit 1
     }
 done
 
-"$CC" -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -O2 \
+"$ICK" -fno-link-libatomic -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -O2 \
     "$script_dir/speaker-tone-alsa.c" -lasound -o "$program"
 
 sudo debootstrap \
