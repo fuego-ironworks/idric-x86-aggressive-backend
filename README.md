@@ -47,8 +47,8 @@ Evidence is retained under `build/checked-x86/<fixture>/`.
 [`backend/small_scalars.py`](backend/small_scalars.py) adds direct x86-64 scalar
 target support for the five compact-format specification families documented by
 the ARM Thumb work: Float16, OCP FP8 (E4M3 and E5M2), OCP E3M2,
-Ootomo-Naruse E5M3, and Idris 2 Bits8. Float16/OFP8/E3M2 widen one value at a
-time to scalar Float32 SSE arithmetic and round back immediately; E5M3 remains
+Ootomo–Naruse OotomoE5M3, and Idris 2 Bits8. Float16/OFP8/E3M2 widen one value at a
+time to scalar Float32 SSE arithmetic and round back immediately; OotomoE5M3 remains
 storage-only; Bits8 uses scalar general-purpose-register operations.
 
 This is target primitive evidence, not a claim that the current compiler-owned
@@ -70,7 +70,7 @@ the exact format and evidence boundary.
   compiler handoff surface, process convention, inspection evidence, and stack
   reconciliation
 - [`docs/small-scalar-formats.md`](docs/small-scalar-formats.md): Float16,
-  FP8, E3M2, E5M3, and Bits8 target semantics and native evidence boundary
+  FP8, E3M2, OotomoE5M3, and Bits8 target semantics and native evidence boundary
 
 Top-level symbolic links expose the same implementation and acceptance files
 without moving the preserved PR work.

@@ -25,7 +25,7 @@ write_receipt() {
   diagnostic=${2:-none}
   {
     printf 'CURRENT_HEAD_COMPATIBILITY\t1\n'
-    printf 'repository\tisomorphisms/idric-x86-aggressive-backend\n'
+    printf 'repository\tfuego-ironworks/idric-x86-aggressive-backend\n'
     printf 'requested_ref\t%s\n' "${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-local}}"
     printf 'resolved_sha\t%s\n' "$backend_sha"
     printf 'dirty_state\t%s\n' "$backend_dirty"

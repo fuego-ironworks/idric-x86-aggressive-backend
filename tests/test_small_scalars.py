@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import backend.small_scalars as scalar_api
+
 from backend.small_scalars import (
     E3M2,
     FLOAT16,
@@ -25,10 +27,10 @@ from backend.small_scalars import (
     bits8_sub,
     bits8_test_bit,
     build_bits8_binary_elf,
-    build_e5m3_roundtrip_elf,
+    build_ootomo_e5m3_roundtrip_elf,
     build_float_binary_elf,
-    e5m3_decode_f32,
-    e5m3_encode_f32,
+    ootomo_e5m3_decode_f32,
+    ootomo_e5m3_encode_f32,
 )
 
 
@@ -44,6 +46,24 @@ def run_elf(image: bytes) -> bytes:
 
 
 class SmallScalarCodecTest(unittest.TestCase):
+    def test_ambiguous_storage_api_is_absent(self):
+        for name in (
+            "e5m3_encode_f32", "e5m3_decode_f32",
+            "build_e5m3_binary_elf", "build_e5m3_unary_elf",
+            "build_e5m3_roundtrip_elf",
+        ):
+            self.assertFalse(hasattr(scalar_api, name), name)
+
+    def test_equal_storage_width_does_not_mean_equal_numbers(self):
+        # The same byte is three different numbers in the three codebooks.
+        self.assertEqual(OFP8_E4M3.decode(0x78), 256.0)
+        self.assertEqual(OFP8_E5M2.decode(0x78), 32768.0)
+        self.assertEqual(ootomo_e5m3_decode_f32(0x78), 1.0625)
+        self.assertEqual(OFP8_E4M3.encode_f32(-1.0, saturating=True), 0xB8)
+        self.assertEqual(OFP8_E5M2.encode_f32(-1.0, saturating=True), 0xBC)
+        with self.assertRaises(ScalarDomainError):
+            ootomo_e5m3_encode_f32(-1.0)
+
     def test_float16_boundaries(self):
         self.assertEqual(FLOAT16.encode_f32(0.0), 0x0000)
         self.assertEqual(FLOAT16.encode_f32(-0.0), 0x8000)
@@ -96,13 +116,13 @@ class SmallScalarCodecTest(unittest.TestCase):
                 self.assertEqual(fmt.encode_f32(value, **kwargs), payload, (fmt.name, payload, value))
 
     def test_ootomo_e5m3_exact_recipe(self):
-        self.assertEqual(e5m3_encode_f32(1.0), 0x78)
-        self.assertEqual(e5m3_decode_f32(0x78), 1.0625)
+        self.assertEqual(ootomo_e5m3_encode_f32(1.0), 0x78)
+        self.assertEqual(ootomo_e5m3_decode_f32(0x78), 1.0625)
         for code in range(256):
-            self.assertEqual(e5m3_encode_f32(e5m3_decode_f32(code)), code)
+            self.assertEqual(ootomo_e5m3_encode_f32(ootomo_e5m3_decode_f32(code)), code)
         for invalid in (0.0, -1.0, math.inf, math.nan):
             with self.assertRaises(ScalarDomainError):
-                e5m3_encode_f32(invalid)
+                ootomo_e5m3_encode_f32(invalid)
 
     def test_bits8_contract(self):
         self.assertEqual(bits8_add(255, 1), 0)
@@ -123,6 +143,30 @@ class SmallScalarCodecTest(unittest.TestCase):
 @unittest.skipUnless(platform.system() == "Linux" and platform.machine() == "x86_64",
                      "direct compact-scalar acceptance requires x86_64 Linux")
 class SmallScalarNativeTest(unittest.TestCase):
+    def test_signed_fp8_every_byte_executes_in_its_own_codebook(self):
+        # Independently specified OCP classifications; the generated program
+        # decodes, multiplies by +1 in scalar binary32, and encodes the result.
+        # No Python codec computes the expected byte.
+        formats = (
+            (OFP8_E4M3, 0x38, 0x7F, 0x7F, None, 0x7E),
+            (OFP8_E5M2, 0x3C, 0x7D, 0x7D, 0x7C, 0x7B),
+        )
+        for fmt, one, first_nan, canonical_nan, infinity, maximum in formats:
+            for saturating in (False, True):
+                for payload in range(256):
+                    magnitude = payload & 0x7F
+                    if magnitude >= first_nan:
+                        expected = canonical_nan
+                    elif saturating and magnitude == infinity:
+                        expected = (payload & 0x80) | maximum
+                    else:
+                        expected = payload
+                    with self.subTest(format=fmt.name, mode=saturating, byte=payload):
+                        image = build_float_binary_elf(
+                            fmt, payload, one, "mul", saturating=saturating
+                        )
+                        self.assertEqual(run_elf(image), bytes([expected]))
+
     def test_float_formats_compute_and_requantize_in_x86(self):
         cases = [
             (FLOAT16, 0x3E00, 0x3800, "add", None, 0x4000),
@@ -161,8 +205,8 @@ class SmallScalarNativeTest(unittest.TestCase):
                 else:
                     self.assertEqual(out, bytes([expected]))
 
-    def test_e5m3_figures_roundtrip_all_payloads_in_x86(self):
-        self.assertEqual(run_elf(build_e5m3_roundtrip_elf()), bytes(range(256)))
+    def test_ootomo_e5m3_figures_roundtrip_all_payloads_in_x86(self):
+        self.assertEqual(run_elf(build_ootomo_e5m3_roundtrip_elf()), bytes(range(256)))
 
     def test_bits8_machine_arithmetic(self):
         cases = [

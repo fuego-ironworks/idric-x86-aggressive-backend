@@ -16,10 +16,13 @@ jobs:
     timeout-minutes: 50
     steps:
       - name: Check out x86 backend
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Check out current declared Idriç compiler
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: isomorphisms/Idric
           ref: ${{ env.IDRIC_COMPILER_REF }}
@@ -36,7 +39,7 @@ jobs:
 
       - name: Retain compiler/backend/ELF/native evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: checked-x86-64-evidence
           path: build/checked-x86
