@@ -20,7 +20,7 @@ arithmetic policy.
 | OCP OFP8 E4M3 | signed 8-bit `1/4/3` | exact payload; widen to Float32; scalar arithmetic; explicit saturating/non-saturating requantization |
 | OCP OFP8 E5M2 | signed 8-bit `1/5/2` | exact payload; widen to Float32; scalar arithmetic; explicit saturating/non-saturating requantization |
 | OCP FP6 E3M2 | signed 6-bit `1/3/2` | low six bits; widen to Float32; scalar arithmetic; ties-to-even with required saturation |
-| Ootomo-Naruse E5M3 | unsigned 8-bit `5/3` storage | exact Figure 3 / Figure 4 conversion only; no invented arithmetic |
+| Ootomo–Naruse OotomoE5M3 | unsigned 8-bit `5/3` storage | exact Figure 3 / Figure 4 conversion only; no invented arithmetic |
 | Idris 2 Bits8 | unsigned 8-bit integer | low eight bits in a GPR; modular arithmetic, unsigned division/remainder/order, logical shifts and bit operations |
 
 The small floating payload is not replaced by Float32 storage. Float32 is the
@@ -59,9 +59,9 @@ magnitude.
 Float16 keeps IEEE signed zero, subnormals, infinities and NaNs. The local
 canonical NaN produced by compact conversion is `0x7e00`.
 
-## Ootomo-Naruse E5M3
+## Ootomo–Naruse OotomoE5M3
 
-E5M3 is kept as the unsigned storage format published by Hiroyuki Ootomo and
+OotomoE5M3 is kept as the unsigned storage format published by Hiroyuki Ootomo and
 Akira Naruse, not reinterpreted as a signed nine-bit float and not given local
 arithmetic.
 
@@ -100,7 +100,7 @@ signed results, midpoint ties, and requantization in the generated program.
 This is target-backend primitive evidence. The compiler-owned
 `EDRIC_ONE_STEP_BODY v1` handoff in [`backend/idric_x86.py`](../backend/idric_x86.py)
 does not yet expose these floating operations, so this work does not claim that
-ordinary `.idric` source can already reach Float16, FP8, E3M2, or E5M3 through
+ordinary `.idric` source can already reach Float16, FP8, E3M2, or OotomoE5M3 through
 that handoff. Bits8 source-level coverage is likewise separate from the direct
 target primitive implemented here.
 
@@ -123,16 +123,39 @@ target primitive implemented here.
 ## Observational narrow-float arithmetic and geometry
 
 `make low-precision-observe` runs one numerical observation suite over
-Float16, E4M3, E5M2, E3M2, and E5M3. It reports reference, observed value, and
+Float16, E4M3, E5M2, E3M2, and OotomoE5M3. It reports reference, observed value, and
 residue for primitive arithmetic, powers, square root, the 14-by-26 Dakota
 Jacobian-vector product, planar rotation, and the two-position caster
 multiplier. Residue is data, not a pass/fail threshold.
 
 Every format receives the same source numerical fixture. The established E3M2
 Jacobian/direction payloads are decoded once and those numerical values are
-encoded independently into each format before arithmetic. E5M3 remains a
+encoded independently into each format before arithmetic. OotomoE5M3 remains a
 storage format: the suite uses a test-only decode/Float32-operation/encode path
 for representable positive cases and reports the zero/negative Jacobian cases
 as outside its published domain.
 
 `make e3m2-observe` remains as a filtered view of the same suite.
+
+## Corrected public storage names
+
+The positive-only research codec is exposed as `ootomo_e5m3_encode_f32`,
+`ootomo_e5m3_decode_f32`, and `build_ootomo_e5m3_*_elf`. The observer selects it
+with `--format OotomoE5M3`; the ambiguous `--format E5M3` and old bare Python
+API names are rejected or absent. No compatibility aliases are supplied.
+
+Signed numerical work selects `OFP8_E4M3` or `OFP8_E5M2`. Byte 0x78 means
+256 in E4M3, 32768 in E5M2, and 1.0625 in Ootomo storage, so a shared byte
+width cannot justify reinterpreting one codebook as another.
+
+The direct native FP8 test executes every one of the 256 bytes in each format
+under both saturating and non-saturating conversion. Its expected finite bytes,
+NaN classes and E5M2 infinity cases are specified independently of the Python
+reference encoder. This is 1024 generated-machine cases. The existing unsigned
+256-code native round trip remains a separate storage test.
+
+This correction belongs to
+[Flexible Pipes issue 83](https://github.com/isomorphisms/flexible-pipes/issues/83).
+It does not add floating-point operations to the compiler-owned checked-source
+handoff. The owned Float32 handoff and source-to-x86 FP8 integration remain
+required before that separate acceptance claim can be made.

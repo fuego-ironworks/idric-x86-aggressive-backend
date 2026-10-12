@@ -16,12 +16,12 @@ from backend.small_scalars import (
     OFP8_E5M2,
     ScalarDomainError,
     SignedFloatFormat,
-    build_e5m3_binary_elf,
-    build_e5m3_unary_elf,
+    build_ootomo_e5m3_binary_elf,
+    build_ootomo_e5m3_unary_elf,
     build_float_binary_elf,
     build_float_unary_elf,
-    e5m3_decode_f32,
-    e5m3_encode_f32,
+    ootomo_e5m3_decode_f32,
+    ootomo_e5m3_encode_f32,
 )
 
 
@@ -81,12 +81,12 @@ class Format:
 
     def encode(self, value: float) -> int:
         if self.signed is None:
-            return e5m3_encode_f32(value)
+            return ootomo_e5m3_encode_f32(value)
         return self.signed.encode_f32(value, saturating=self.saturating)
 
     def decode(self, payload: int) -> float:
         if self.signed is None:
-            return e5m3_decode_f32(payload)
+            return ootomo_e5m3_decode_f32(payload)
         return self.signed.decode(payload)
 
 
@@ -95,7 +95,7 @@ FORMATS = [
     Format("E4M3", OFP8_E4M3),
     Format("E5M2", OFP8_E5M2),
     Format("E3M2", E3M2),
-    Format("E5M3", None),
+    Format("OotomoE5M3", None),
 ]
 
 
@@ -134,7 +134,7 @@ def run_payload(image: bytes, width: int) -> int:
 def binary(key: str, left: int, right: int, operation: str) -> int:
     fmt = next(item for item in FORMATS if item.key == key)
     if fmt.signed is None:
-        image = build_e5m3_binary_elf(left, right, operation)
+        image = build_ootomo_e5m3_binary_elf(left, right, operation)
     else:
         image = build_float_binary_elf(
             fmt.signed, left, right, operation, saturating=fmt.saturating
@@ -146,7 +146,7 @@ def binary(key: str, left: int, right: int, operation: str) -> int:
 def unary(key: str, value: int, operation: str) -> int:
     fmt = next(item for item in FORMATS if item.key == key)
     if fmt.signed is None:
-        image = build_e5m3_unary_elf(value, operation)
+        image = build_ootomo_e5m3_unary_elf(value, operation)
     else:
         image = build_float_unary_elf(
             fmt.signed, value, operation, saturating=fmt.saturating
@@ -269,10 +269,10 @@ def observe(fmt: Format) -> None:
     print("  before every multiply/add is executed and requantized in that format.")
     print("  rotation inputs are the same for all formats: cos=7/8, sin=3/8, vector=[3,4].")
     print("  caster multiplier input is the same for all formats: 3/2.")
-    if fmt.key == "E5M3":
-        print("  E5M3 is unsigned positive-normal storage; zero/negative Jacobian inputs")
+    if fmt.key == "OotomoE5M3":
+        print("  OotomoE5M3 is unsigned positive-normal storage; zero/negative Jacobian inputs")
         print("  are reported as domain rather than silently omitted or assigned fake encodings.")
-        print("  E5M3 arithmetic here is test-only: storage decode -> Float32 op -> storage encode.")
+        print("  OotomoE5M3 arithmetic here is test-only: storage decode -> Float32 op -> storage encode.")
     print()
 
 
