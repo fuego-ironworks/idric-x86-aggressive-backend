@@ -652,7 +652,11 @@ class Frame:
 
 
 class Lowerer:
-    def __init__(self, artifact: CheckedArtifact, functions: Mapping[str, FunctionDef]):
+    def __init__(self, artifact: CheckedArtifact, functions: Mapping[str, FunctionDef],
+                 *, target: str = "linux-x86_64"):
+        if target not in ("linux-x86_64", "netbsd-x86_64"):
+            raise UnsupportedError("unsupported_os_target", target)
+        self.target = target
         self.artifact = artifact
         self.functions = functions
         self.assembler = Assembler()
@@ -778,18 +782,23 @@ class Lowerer:
             self.load(frame, call.arguments[0], RAX)
             self.assembler.emit(_stack_store(frame.output_offset, RAX),
                                 f"mov [rsp + {frame.output_offset}], rax ; actual output byte")
-            self.assembler.emit(_mov_immediate(RAX, 1), "mov rax, 1 ; SYS_write")
+            write_number = 4 if self.target == "netbsd-x86_64" else 1
+            self.assembler.emit(_mov_immediate(RAX, write_number),
+                                f"mov rax, {write_number} ; SYS_write")
             self.assembler.emit(_mov_immediate(RDI, 1), "mov rdi, 1 ; stdout")
             self.assembler.emit(_lea_stack(RSI, frame.output_offset),
                                 f"lea rsi, [rsp + {frame.output_offset}]")
             self.assembler.emit(_mov_immediate(RDX, 1), "mov rdx, 1")
             self.assembler.emit(b"\x0f\x05", "syscall ; write")
+            if self.target == "netbsd-x86_64":
+                self.assembler.rel32(b"\x0f\x82", "process:write_failure",
+                                     "jc process:write_failure ; NetBSD syscall error")
             self.assembler.emit(_mov_immediate(R11, 1), "mov r11, 1 ; required write count")
             self.assembler.emit(_compare(RAX, R11), "cmp rax, r11 ; write returned one byte")
             self.assembler.rel32(b"\x0f\x85", "process:write_failure",
                                  "jne process:write_failure")
             self.assembler.emit(_xor_register(RAX), "xor rax, rax ; IO unit result")
-            self.rows.append(PlanRow(frame.function.name, "putChar", "linux_syscall",
+            self.rows.append(PlanRow(frame.function.name, "putChar", self.target + "_syscall",
                                      "direct write(1, byte, 1); world token eliminated"))
             self.write_count += 1
             self.needs_write_failure = True
@@ -857,7 +866,9 @@ class Lowerer:
         if entry:
             self.assembler.emit(_stack_adjust(False, frame.size), f"add rsp, {frame.size}")
             self.assembler.emit(_mov_immediate(RDI, 0), "mov rdi, 0 ; status")
-            self.assembler.emit(_mov_immediate(RAX, 60), "mov rax, 60 ; SYS_exit")
+            exit_number = 1 if self.target == "netbsd-x86_64" else 60
+            self.assembler.emit(_mov_immediate(RAX, exit_number),
+                                f"mov rax, {exit_number} ; SYS_exit")
             self.assembler.emit(b"\x0f\x05", "syscall ; exit")
         else:
             self.assembler.emit(_stack_adjust(False, frame.size), f"add rsp, {frame.size}")
@@ -872,13 +883,15 @@ class Lowerer:
         if self.needs_write_failure:
             self.assembler.label("process:write_failure")
             self.assembler.emit(_mov_immediate(RDI, 1), "mov rdi, 1 ; write failure status")
-            self.assembler.emit(_mov_immediate(RAX, 60), "mov rax, 60 ; SYS_exit")
+            exit_number = 1 if self.target == "netbsd-x86_64" else 60
+            self.assembler.emit(_mov_immediate(RAX, exit_number),
+                                f"mov rax, {exit_number} ; SYS_exit")
             self.assembler.emit(b"\x0f\x05", "syscall ; exit after write failure")
         machine, instruction_listing = self.assembler.finish()
         selected = tuple(self.functions[name] for name in sorted(self.compiled))
         plan = ScalarPlan(self.artifact, entry, selected, tuple(self.rows))
         listing = instruction_listing + render_backend_plan(plan)
-        return CompiledImage(write_elf(machine), listing, plan)
+        return CompiledImage(write_elf(machine, target=self.target), listing, plan)
 
 
 def make_scalar_plan(artifact: CheckedArtifact) -> tuple[dict[str, FunctionDef], str]:
@@ -888,9 +901,10 @@ def make_scalar_plan(artifact: CheckedArtifact) -> tuple[dict[str, FunctionDef],
     return functions, entry
 
 
-def compile_checked_artifact(artifact: CheckedArtifact) -> CompiledImage:
+def compile_checked_artifact(artifact: CheckedArtifact, *,
+                             target: str = "linux-x86_64") -> CompiledImage:
     functions, entry = make_scalar_plan(artifact)
-    return Lowerer(artifact, functions).compile(entry)
+    return Lowerer(artifact, functions, target=target).compile(entry)
 
 
 def render_backend_plan(plan: ScalarPlan) -> str:
@@ -905,13 +919,14 @@ def render_backend_plan(plan: ScalarPlan) -> str:
 
 def compile_artifact(artifact_path: Path, output_path: Path,
                      listing_path: Path | None = None,
-                     source_path: Path | None = None) -> CompiledImage:
+                     source_path: Path | None = None,
+                     *, target: str = "linux-x86_64") -> CompiledImage:
     artifact = parse_checked_artifact(artifact_path)
     if source_path is not None:
         actual = hashlib.sha256(source_path.read_bytes()).hexdigest()
         if actual != artifact.source_sha256:
             raise ArtifactError("source_digest_mismatch", f"{artifact.source_sha256} vs {actual}")
-    compiled = compile_checked_artifact(artifact)
+    compiled = compile_checked_artifact(artifact, target=target)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(compiled.elf)
     output_path.chmod(0o755)
@@ -987,12 +1002,16 @@ def main() -> None:
     parser.add_argument("artifact", type=Path)
     parser.add_argument("-o", "--output", type=Path, required=True)
     parser.add_argument("--source", type=Path)
+    parser.add_argument("--target", choices=("linux-x86_64", "netbsd-x86_64"),
+                        default="linux-x86_64")
     parser.add_argument("--listing", type=Path)
     parser.add_argument("--run-receipt", type=Path)
     parser.add_argument("--expect-stdout-hex")
     arguments = parser.parse_args()
+    if arguments.run_receipt is not None and arguments.target != "linux-x86_64":
+        parser.error("native execution receipts are Linux-only; NetBSD needs a NetBSD runner")
     compiled = compile_artifact(arguments.artifact, arguments.output, arguments.listing,
-                                arguments.source)
+                                arguments.source, target=arguments.target)
     if arguments.run_receipt is not None:
         try:
             expected_stdout = (None if arguments.expect_stdout_hex is None
