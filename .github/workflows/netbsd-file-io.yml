@@ -1,0 +1,70 @@
+name: Native x86-64 file I/O and NetBSD cross-build
+
+on:
+  push:
+    branches:
+      - netbsd-native-file-io-20261023
+    paths:
+      - 'backend/elf64.py'
+      - 'backend/native_file_io.py'
+      - 'tests/test_native_file_io.py'
+      - '.github/workflows/netbsd-file-io.yml'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cross-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests and Linux native I/O acceptance
+        run: python3 -m unittest discover -s tests -p 'test_native_file_io.py' -v
+      - name: Cross-compile NetBSD ELF64 directly
+        run: |
+          python3 -m backend.native_file_io \
+            --target netbsd-x86_64 \
+            --output build/netbsd/file-reader-x86_64 \
+            --listing build/netbsd/file-reader.disassembly-intent.txt
+          file build/netbsd/file-reader-x86_64
+          readelf -h -l -n build/netbsd/file-reader-x86_64 > build/netbsd/readelf.txt
+          grep -F 'Advanced Micro Devices X86-64' build/netbsd/readelf.txt
+          grep -F 'NOTE' build/netbsd/readelf.txt
+          grep -F 'NetBSD' build/netbsd/readelf.txt
+          grep -F 'IDENT 1000000000' build/netbsd/readelf.txt
+          python3 -m backend.native_file_io \
+            --target netbsd-x86_64 \
+            --output build/netbsd/file-reader-repeat
+          cmp build/netbsd/file-reader-x86_64 build/netbsd/file-reader-repeat
+          sha256sum build/netbsd/file-reader-x86_64 > build/netbsd/SHA256SUMS
+          dd if=build/netbsd/file-reader-x86_64 of=build/netbsd/code.bin \
+            bs=1 skip=4096 status=none
+          objdump -D -b binary -m i386:x86-64 -Mintel \
+            --adjust-vma=0x401000 build/netbsd/code.bin \
+            > build/netbsd/x86-instructions.txt
+      - name: Declare exact evidence boundary
+        run: |
+          {
+            printf 'target\tnetbsd-x86_64\n'
+            printf 'stage\tcross_codegen\tPASS\n'
+            printf 'stage\telf_ident\tPASS\n'
+            printf 'stage\tlinux_semantic_oracle\tPASS\n'
+            printf 'stage\tidric_checked_io_handoff\tUNIMPLEMENTED\n'
+            printf 'stage\tnetbsd_native_execution\tNOT_RUN\n'
+            printf 'stage\tlive_mail_mutation\tDISABLED\n'
+          } > build/netbsd/receipt.tsv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: netbsd-amd64-readonly-file-reader
+          path: |
+            build/netbsd/file-reader-x86_64
+            build/netbsd/readelf.txt
+            build/netbsd/x86-instructions.txt
+            build/netbsd/file-reader.disassembly-intent.txt
+            build/netbsd/SHA256SUMS
+            build/netbsd/receipt.tsv
+          if-no-files-found: error
