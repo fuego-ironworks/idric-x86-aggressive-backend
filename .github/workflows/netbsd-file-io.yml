@@ -7,7 +7,9 @@ on:
     paths:
       - 'backend/elf64.py'
       - 'backend/native_file_io.py'
+      - 'backend/idric_x86.py'
       - 'tests/test_native_file_io.py'
+      - 'tests/test_checked_netbsd_scalar.py'
       - '.github/workflows/netbsd-file-io.yml'
   pull_request:
     branches:
@@ -23,7 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Unit tests and Linux native I/O acceptance
-        run: python3 -m unittest discover -s tests -p 'test_native_file_io.py' -v
+        run: |
+          python3 -m unittest discover -s tests -p 'test_native_file_io.py' -v
+          python3 -m unittest discover -s tests -p 'test_checked_netbsd_scalar.py' -v
       - name: Cross-compile NetBSD ELF64 directly
         run: |
           python3 -m backend.native_file_io \
