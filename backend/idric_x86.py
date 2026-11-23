@@ -56,6 +56,8 @@ class FunctionDef:
     name: str
     arguments: tuple[int, ...]
     body_text: str
+    expression: Expr | None = None
+    specialization_rows: tuple[PlanRow, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,24 @@ class Operation(Expr):
 class Call(Expr):
     name: str
     arguments: tuple[Expr, ...]
+
+
+@dataclass(frozen=True)
+class Erased(Expr):
+    """An erased argument or expression, never an integer."""
+
+
+@dataclass(frozen=True)
+class Partial(Expr):
+    target: str
+    missing: int
+    arguments: tuple[Expr, ...]
+
+
+@dataclass(frozen=True)
+class Apply(Expr):
+    closure: Expr
+    argument: Expr
 
 
 @dataclass(frozen=True)
@@ -309,6 +329,8 @@ def parse_expression(source: str) -> Expr:
     while _outer_parentheses(text):
         text = text[1:-1].strip()
 
+    if text in {"[__]", "___"}:
+        return Erased()
     variable = VARIABLE.fullmatch(text)
     if variable:
         return Var(int(variable.group(1)))
@@ -368,18 +390,34 @@ def parse_expression(source: str) -> Expr:
         default = None if default_text is None else parse_expression(default_text)
         return ConstCase(scrutinee, tuple(alternatives), default)
 
+    partial = re.match(r"<(.+) underapp ([0-9]+)>\(", text)
+    if partial:
+        opening = partial.end() - 1
+        if _matching(text, opening) != len(text) - 1:
+            raise ArtifactError("malformed_partial_application", text)
+        arguments = text[opening + 1:-1]
+        items = () if not arguments else tuple(
+            parse_expression(item) for item in _split_top_level(arguments, ", "))
+        return Partial(partial.group(1), int(partial.group(2)), items)
+    if text.startswith("<") or " underapp " in text:
+        raise UnsupportedError("under_application", text)
+    application = re.match(r"(v[0-9]+|\[__\]) @ \(", text)
+    if application:
+        opening = application.end() - 1
+        if _matching(text, opening) != len(text) - 1:
+            raise ArtifactError("malformed_closure_application", text)
+        return Apply(parse_expression(application.group(1)),
+                     parse_expression(text[opening + 1:-1]))
+    if " @ " in text:
+        raise UnsupportedError("closure_application", text)
     opening = text.find("(")
     if opening > 0 and _matching(text, opening) == len(text) - 1:
         name = text[:opening]
-        if name.startswith("<") or " underapp " in name:
-            raise UnsupportedError("under_application", name)
         argument_text = text[opening + 1:-1]
         arguments = () if not argument_text else tuple(
             parse_expression(item) for item in _split_top_level(argument_text, ", ")
         )
         return Call(name, arguments)
-    if " @ " in text:
-        raise UnsupportedError("closure_application", text)
     raise UnsupportedError("unsupported_one_step_expression", text)
 
 
@@ -424,6 +462,210 @@ def _let_variables(expression: Expr) -> set[int]:
             result |= _let_variables(expression.default)
         return result
     return set()
+
+
+@dataclass(frozen=True)
+class KnownClosure:
+    target: str
+    missing: int
+    captured: tuple[Var | Literal | Erased | KnownClosure, ...]
+
+
+KnownValue = Var | Literal | Erased | KnownClosure
+Binding = tuple[int, Expr]
+
+
+class KnownClosureSpecializer:
+    """Bounded, first-order specialization of checked ANF, not a source interpreter.
+
+    Each scalar computation is emitted once into a fresh lexical binding. Closures
+    and erased values are compile-time shapes; captures refer to already bound
+    machine values, never to expressions that could repeat an effect. Saturation
+    expands the exact named body; recursion and closure-valued case joins are not
+    supported by this deliberately small route.
+    """
+
+    def __init__(self, functions: Mapping[str, FunctionDef], entry: str):
+        self.functions = functions
+        self.entry = entry
+        self.next_variable = max(functions[entry].arguments, default=-1) + 1
+        self.world = Var(functions[entry].arguments[0])
+        self.active: list[str] = []
+        self.rows: list[PlanRow] = []
+        self.changed = False
+        self.budget = 20000
+        self.parsed: dict[str, Expr] = {}
+
+    @staticmethod
+    def scalar(value: KnownValue, where: str) -> Var | Literal:
+        if isinstance(value, Erased):
+            raise UnsupportedError("observable_erased_value", where)
+        if not isinstance(value, (Var, Literal)):
+            raise UnsupportedError("observable_closure_value", where)
+        return value
+
+    @staticmethod
+    def require_atoms(arguments: Sequence[Expr], where: str) -> None:
+        if any(not isinstance(argument, (Var, Literal, Erased)) for argument in arguments):
+            raise UnsupportedError("non_atomic_operand", where)
+
+    def bind(self, bindings: list[Binding], expression: Expr) -> Var:
+        number = self.next_variable
+        self.next_variable += 1
+        bindings.append((number, expression))
+        return Var(number)
+
+    @staticmethod
+    def finish(bindings: Sequence[Binding], result: Expr) -> Expr:
+        for number, value in reversed(bindings):
+            result = Let(number, value, result)
+        return result
+
+    def arity(self, target: str) -> int:
+        if target == "Prelude.IO.prim__putChar":
+            return 2
+        if target not in self.functions:
+            if target.startswith("%con "):
+                raise UnsupportedError("unsupported_constructor", target)
+            raise UnsupportedError("unsupported_call", target)
+        return len(self.functions[target].arguments)
+
+    def call(self, target: str, arguments: tuple[KnownValue, ...],
+             bindings: list[Binding]) -> KnownValue:
+        arity = self.arity(target)
+        if len(arguments) != arity:
+            code = "putchar_arity" if target == "Prelude.IO.prim__putChar" else "call_arity"
+            raise ArtifactError(code, f"{target}: {len(arguments)} vs {arity}")
+        if target == "Prelude.IO.prim__putChar":
+            byte = self.scalar(arguments[0], target + " character")
+            # The world slot is not observable by this particular native
+            # primitive. Erased arguments are never replaced by zero as data.
+            world = arguments[1]
+            if isinstance(world, KnownClosure):
+                raise UnsupportedError("observable_closure_value", target + " world")
+            return self.bind(bindings, Call(target, (byte, self.world)))
+        if target in self.active:
+            raise UnsupportedError("recursive_call", " -> ".join((*self.active, target)))
+        function = self.functions[target]
+        if len(set(function.arguments)) != len(function.arguments):
+            raise ArtifactError("duplicate_function_argument", target)
+        if target not in self.parsed:
+            self.parsed[target] = (function.expression if function.expression is not None
+                                   else parse_expression(function.body_text))
+        self.active.append(target)
+        try:
+            return self.evaluate(self.parsed[target], dict(zip(function.arguments, arguments)),
+                                 bindings, target)
+        finally:
+            self.active.pop()
+
+    def evaluate(self, expression: Expr, environment: Mapping[int, KnownValue],
+                 bindings: list[Binding], where: str) -> KnownValue:
+        self.budget -= 1
+        if self.budget < 0:
+            raise UnsupportedError("specialization_budget", where)
+        if isinstance(expression, Literal):
+            return expression
+        if isinstance(expression, Erased):
+            self.changed = True
+            return expression
+        if isinstance(expression, Var):
+            if expression.number not in environment:
+                raise ArtifactError("unknown_temporary", f"{where}.v{expression.number}")
+            return environment[expression.number]
+        if isinstance(expression, Let):
+            value = self.evaluate(expression.value, environment, bindings, where)
+            extended = dict(environment)
+            extended[expression.variable] = value
+            return self.evaluate(expression.body, extended, bindings, where)
+        if isinstance(expression, Operation):
+            self.require_atoms(expression.arguments, expression.name)
+            arguments = tuple(self.scalar(self.evaluate(item, environment, bindings, where),
+                                          where + " " + expression.name)
+                              for item in expression.arguments)
+            return self.bind(bindings, Operation(expression.name, arguments))
+        if isinstance(expression, Call):
+            self.require_atoms(expression.arguments, expression.name)
+            arguments = tuple(self.evaluate(item, environment, bindings, where)
+                              for item in expression.arguments)
+            return self.call(expression.name, arguments, bindings)
+        if isinstance(expression, Partial):
+            self.changed = True
+            self.require_atoms(expression.arguments, expression.target)
+            arity = self.arity(expression.target)
+            if expression.missing <= 0 or len(expression.arguments) + expression.missing != arity:
+                raise ArtifactError("partial_application_arity",
+                                    f"{expression.target}: arity={arity}, "
+                                    f"captured={len(expression.arguments)}, missing={expression.missing}")
+            captured = tuple(self.evaluate(item, environment, bindings, where)
+                             for item in expression.arguments)
+            self.rows.append(PlanRow(where, expression.target, "closure_capture",
+                                     f"arity={arity}; captured={len(captured)}; missing={expression.missing}"))
+            return KnownClosure(expression.target, expression.missing, captured)
+        if isinstance(expression, Apply):
+            self.changed = True
+            self.require_atoms((expression.closure, expression.argument), where + " application")
+            closure = self.evaluate(expression.closure, environment, bindings, where)
+            argument = self.evaluate(expression.argument, environment, bindings, where)
+            if isinstance(closure, Erased):
+                raise UnsupportedError("observable_erased_value", where + " closure target")
+            if not isinstance(closure, KnownClosure):
+                raise UnsupportedError("unknown_closure_target", where)
+            captured = (*closure.captured, argument)
+            missing = closure.missing - 1
+            self.rows.append(PlanRow(where, closure.target, "closure_apply",
+                                     f"captured={len(captured)}; missing={missing}; "
+                                     f"argument={'erased' if isinstance(argument, Erased) else 'value'}"))
+            if missing:
+                return KnownClosure(closure.target, missing, captured)
+            self.rows.append(PlanRow(where, closure.target, "closure_saturated",
+                                     "exact named body; ordered arguments"))
+            return self.call(closure.target, captured, bindings)
+        if isinstance(expression, ConstCase):
+            self.require_atoms((expression.scrutinee,), where + " case")
+            scrutinee = self.scalar(self.evaluate(expression.scrutinee, environment, bindings, where),
+                                    where + " case scrutinee")
+            branches: list[tuple[int | None, list[Binding], KnownValue]] = []
+            for constant, body in expression.alternatives:
+                branch: list[Binding] = []
+                branches.append((constant, branch, self.evaluate(body, environment, branch, where)))
+            if expression.default is not None:
+                branch = []
+                branches.append((None, branch, self.evaluate(expression.default, environment, branch, where)))
+            if not branches:
+                raise ArtifactError("empty_case", where)
+            erased = all(isinstance(value, Erased) for _, _, value in branches)
+            if any(isinstance(value, KnownClosure) for _, _, value in branches):
+                raise UnsupportedError("closure_case_result", where)
+            if not erased and any(isinstance(value, Erased) for _, _, value in branches):
+                raise UnsupportedError("incompatible_case_result", where)
+            if erased:
+                self.changed = True
+            alternatives: list[tuple[int, Expr]] = []
+            default = None
+            for constant, branch, value in branches:
+                lowered = self.finish(branch, Literal(0) if erased else self.scalar(value, where))
+                if constant is None:
+                    default = lowered
+                else:
+                    alternatives.append((constant, lowered))
+            joined = self.bind(bindings, ConstCase(scrutinee, tuple(alternatives), default))
+            return Erased() if erased else joined
+        raise AssertionError(type(expression))
+
+    def run(self) -> tuple[Expr, tuple[PlanRow, ...]] | None:
+        bindings: list[Binding] = []
+        result = self.call(self.entry, (Erased(),), bindings)
+        if isinstance(result, KnownClosure):
+            raise UnsupportedError("escaping_closure", self.entry)
+        if isinstance(result, Erased):
+            self.changed = True
+        if not self.changed:
+            # Keep the existing first-order native call convention. The walk
+            # above still proves erased entry arguments cannot become data.
+            return None
+        expression = self.finish(bindings, Literal(0) if isinstance(result, Erased) else result)
+        return expression, tuple(self.rows)
 
 
 class ExactRangeProof:
@@ -517,7 +759,8 @@ class ExactRangeProof:
         self.active.append(name)
         try:
             environment = dict(zip(function.arguments, arguments))
-            return self.expression(parse_expression(function.body_text), environment, name)
+            return self.expression(function.expression if function.expression is not None
+                                   else parse_expression(function.body_text), environment, name)
         finally:
             self.active.pop()
 
@@ -673,7 +916,8 @@ class Lowerer:
             raise UnsupportedError("non_atomic_operand", where)
 
     def frame(self, function: FunctionDef, *, entry: bool) -> Frame:
-        expression = parse_expression(function.body_text)
+        expression = (function.expression if function.expression is not None
+                      else parse_expression(function.body_text))
         variables = sorted(set(function.arguments) | _let_variables(expression))
         offsets = {variable: index * 8 for index, variable in enumerate(variables)}
         output_offset = len(variables) * 8
@@ -875,6 +1119,7 @@ class Lowerer:
             self.assembler.emit(b"\xc3", "ret")
 
     def compile(self, entry: str) -> CompiledImage:
+        self.rows.extend(self.functions[entry].specialization_rows)
         self.emit_function(entry, entry=True)
         while self.pending:
             self.emit_function(self.pending.pop(0), entry=False)
@@ -897,6 +1142,14 @@ class Lowerer:
 def make_scalar_plan(artifact: CheckedArtifact) -> tuple[dict[str, FunctionDef], str]:
     functions = parse_functions(artifact)
     entry = _main_name(functions)
+    if len(functions[entry].arguments) != 1:
+        raise UnsupportedError("entry_arity", f"{entry}: expected erased world argument")
+    specialized = KnownClosureSpecializer(functions, entry).run()
+    if specialized is not None:
+        expression, rows = specialized
+        original = functions[entry]
+        functions[entry] = FunctionDef(original.name, original.arguments, original.body_text,
+                                       expression, rows)
     ExactRangeProof(functions).check(entry)
     return functions, entry
 

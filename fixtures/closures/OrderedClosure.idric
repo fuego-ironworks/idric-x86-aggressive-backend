@@ -1,0 +1,10 @@
+module OrderedClosure
+
+%noinline
+write_using : (Char → IO ()) → IO ()
+write_using write_marker = do
+  write_marker 'A'
+  write_marker 'B'
+
+main : IO ()
+main = write_using putChar

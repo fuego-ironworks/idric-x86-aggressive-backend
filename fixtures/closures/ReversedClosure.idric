@@ -1,0 +1,10 @@
+module ReversedClosure
+
+%noinline
+write_using : (Char → IO ()) → IO ()
+write_using write_marker = do
+  write_marker 'B'
+  write_marker 'A'
+
+main : IO ()
+main = write_using putChar
