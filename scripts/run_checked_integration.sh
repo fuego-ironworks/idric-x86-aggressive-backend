@@ -54,6 +54,24 @@ while read -r fixture expected_hex; do
   cmp "$executable" "$second_executable"
   cmp "$listing" "$second_listing"
 
+  # The SAME checked compiler-owned artifact also cross-compiles to NetBSD.
+  # Do not execute this binary on Linux or call cross-codegen native acceptance.
+  netbsd_executable="$directory/$name.netbsd.elf"
+  netbsd_repeat="$directory/$name.netbsd.repeat.elf"
+  netbsd_listing="$directory/$name.netbsd.instructions"
+  python3 "$repo_root/backend/idric_x86.py" "$artifact" \
+    --source "$source" --target netbsd-x86_64 \
+    --output "$netbsd_executable" --listing "$netbsd_listing"
+  python3 "$repo_root/backend/idric_x86.py" "$artifact" \
+    --source "$source" --target netbsd-x86_64 \
+    --output "$netbsd_repeat"
+  cmp "$netbsd_executable" "$netbsd_repeat"
+  readelf -h -l -n "$netbsd_executable" > "$directory/netbsd-readelf.txt"
+  grep -F 'IDENT 1000000000' "$directory/netbsd-readelf.txt" >/dev/null
+  grep -F 'NetBSD' "$directory/netbsd-readelf.txt" >/dev/null
+  grep -F 'syscall ; write' "$netbsd_listing" >/dev/null
+  grep -F 'jc process:write_failure' "$netbsd_listing" >/dev/null
+
   file "$executable" > "$directory/file.txt"
   readelf -h -l -S -d "$executable" > "$directory/readelf.txt"
   grep -F 'ELF 64-bit' "$directory/file.txt" >/dev/null
@@ -83,6 +101,7 @@ while read -r fixture expected_hex; do
   grep -Fx "$(printf 'stage\tsemantic_result\tPASS\t%s' "$expected_hex")" "$receipt" >/dev/null
 
   sha256sum "$source" "$artifact" "$listing" "$executable" \
+    "$netbsd_executable" "$netbsd_listing" "$directory/netbsd-readelf.txt" \
     "$directory/readelf.txt" "$directory/objdump.txt" "$stdout" > "$directory/hashes.sha256"
   {
     printf 'repository\tisomorphisms/Idric\n'
@@ -92,6 +111,7 @@ while read -r fixture expected_hex; do
     printf 'stage\tsource_checked\tPASS\n'
     printf 'stage\tcompiler_handoff_emitted\tPASS\n'
     printf 'stage\tbackend_lowering\tPASS\n'
+    printf 'stage\tnetbsd_cross_codegen\tPASS\tnative_execution=NOT_RUN\n'
     printf 'stage\tx86_encoding\tPASS\n'
     printf 'stage\telf_generated\tPASS\n'
     printf 'stage\telf_independently_validated\tPASS\n'

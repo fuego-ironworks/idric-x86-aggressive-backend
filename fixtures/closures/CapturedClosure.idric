@@ -1,0 +1,14 @@
+module CapturedClosure
+
+%noinline
+write_pair : Char → Char → IO ()
+write_pair first second = do
+  putChar first
+  putChar second
+
+%noinline
+write_using : (Char → IO ()) → IO ()
+write_using writer = writer 'B'
+
+main : IO ()
+main = write_using (write_pair 'A')

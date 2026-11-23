@@ -1,0 +1,48 @@
+name: Checked native partial application
+
+on:
+  pull_request:
+    paths:
+      - 'backend/idric_x86.py'
+      - 'tests/test_checked_closures.py'
+      - 'fixtures/closures/**'
+      - 'scripts/run_checked_closures.sh'
+      - '.github/workflows/checked-closures.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  closure-ir-and-scalar-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          python3 -m unittest discover -s tests -p 'test_checked_closures.py' -v
+          python3 -m unittest discover -s tests -p 'test_checked_scalar.py' -v
+          python3 -m unittest discover -s tests -p 'test_checked_netbsd_scalar.py' -v
+          python3 -m unittest discover -s tests -p 'test_native_file_io.py' -v
+  compiler-produced-closure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: isomorphisms/Idric
+          ref: 29420f7e5a954ba0a66f622f0311298f823fbfff
+          path: .idric
+      - name: Build the pinned checked compiler
+        run: .idric/_/edric bootstrap
+      - name: Regenerate and qualify actual compiler output
+        run: scripts/run_checked_closures.sh
+      - name: Retain evidence, including failure frontiers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checked-native-closure-evidence
+          path: build/checked-closures
+          if-no-files-found: warn

@@ -1,0 +1,10 @@
+module OrderedNamed
+
+%noinline
+write_marker : Char → IO ()
+write_marker character = putChar character
+
+main : IO ()
+main = do
+  write_marker 'A'
+  write_marker 'B'
