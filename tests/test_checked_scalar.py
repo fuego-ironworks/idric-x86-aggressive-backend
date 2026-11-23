@@ -54,6 +54,22 @@ class CheckedScalarBackendTest(unittest.TestCase):
         self.assertEqual(run.stderr, b"")
         return run.stdout, compiled.elf, compiled.listing
 
+    def test_action_returning_main_requires_its_checked_process_entry(self) -> None:
+        cases = (
+            (["M.main = []: 65"], "entry_arity"),
+            (["M.main = []: 65", "{__mainExpression:0} = [0]: M.main()"], "entry_arity"),
+            (["M.main = []: 65",
+              "{__mainExpression:0} = []: %let v0 = (M.main()) in (v0 @ ([__]))"],
+             "unknown_closure_target"),
+            (["M.main = []: 65",
+              "{__mainExpression:0} = []: %let v0 = (%MkWorld) in (Prelude.IO.prim__putChar(v0, v0))"],
+             "observable_erased_value"),
+        )
+        for definitions, code in cases:
+            with self.subTest(definitions=definitions), self.assertRaises(UnsupportedError) as caught:
+                compile_checked_artifact(parse_checked_artifact_bytes(artifact_bytes(definitions)))
+            self.assertEqual(caught.exception.code, code)
+
     @unittest.skipUnless(platform.system() == "Linux" and platform.machine() == "x86_64",
                          "native direct ELF acceptance requires x86_64 Linux")
     def test_checked_print_x_runs_natively(self) -> None:

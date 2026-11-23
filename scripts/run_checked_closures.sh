@@ -11,7 +11,7 @@ test "$(git -C "$compiler_repo" rev-parse HEAD)" = "$pin"
 mkdir -p "$out"
 printf 'compiler\t%s\nbackend\t%s\nbaseline\t%s\n' "$pin" "$(git rev-parse HEAD)" "$baseline" > "$out/revisions.tsv"
 # The reduced callback is generated first, exactly as in compiler PR #158.
-for name in OrderedClosure OrderedDirect OrderedNamed ReversedClosure CapturedClosure; do
+for name in OrderedClosure OrderedDirect OrderedNamed ReversedClosure CapturedClosure ConstructorCallbacks; do
   source="$root/fixtures/closures/$name.idric"
   "$compiler_repo/_/edric" --emit-one-step "$source" -o "$out/$name.one-step"
   "$compiler_repo/_/edric" --emit-one-step "$source" -o "$out/$name.repeat.one-step"
@@ -59,8 +59,13 @@ OrderedDirect 4142
 OrderedNamed 4142
 ReversedClosure 4241
 CapturedClosure 4142
+ConstructorCallbacks 215859414241435a442e
 CASES
 
+# Verify that the executable case actually projected all three constructor shapes.
+for constructor in Both One Quiet; do
+  grep -F "ConstructorCallbacks.$constructor constructor_match" "$out/ConstructorCallbacks.instructions"
+done
 # Structural and native receipt checks are distinct from the compiler frontier.
 # Compare old and new on the original checked file artifact for each target.
 for target in linux-x86_64 netbsd-x86_64; do
@@ -107,17 +112,18 @@ if (cd "$old"; python3 -m backend.idric_x86 "$out/OrderedClosure.one-step" \
 elif ! grep -F 'under_application' "$out/OrderedClosure.baseline.log"; then
   cat "$out/OrderedClosure.baseline.log" >&2; status=1
 fi
-# A different diagnostic alone is not proof of implemented file I/O. Require
-# that the original failure is no longer the erased/closure parser rejection.
+# The file witness constructs the HasIO dictionary and invokes its selected
+# methods before requesting argc. Only the runtime primitive is still missing
+# at this frontier. A future implementation can also produce a checked image.
 for target in linux-x86_64 netbsd-x86_64; do
   before="$out/file-baseline-$target.tsv"
   after="$out/file-candidate-$target.tsv"
   if ! grep -F $'result\tREJECTED\tunsupported_one_step_expression\t[__]' "$before"; then
     echo "Unexpected baseline file frontier: $target" >&2; status=1
   fi
-  if ! grep -E '^result[[:space:]]+(REJECTED|COMPILED_NOT_RUN)' "$after" ||
-     grep -E '^result[[:space:]]+REJECTED[[:space:]]+(under_application|closure_application|unknown_closure_target|partial_application_arity|observable_erased_value|unsupported_one_step_expression[[:space:]]+\[__\])' "$after"; then
-    echo "File closure frontier not advanced: $target" >&2; status=1
+  if ! grep -Fx $'result\tREJECTED\tunsupported_call\tSystem.prim__getArgCount' "$after" &&
+     ! grep -q $'^result\tCOMPILED_NOT_RUN\t' "$after"; then
+    echo "Unexpected file frontier after dictionary application: $target" >&2; status=1
   fi
 done
 # Mutate the actual checked direct artifact, recompute its body digest, and

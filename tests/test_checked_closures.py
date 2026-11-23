@@ -19,11 +19,48 @@ class KnownClosureTests(unittest.TestCase):
             {function.name: function for function in (main, *functions)}, main.name
         ).run()
 
+    def with_constructors(self, body):
+        main = FunctionDef("M.main", (0,), body)
+        return KnownClosureSpecializer({main.name: main}, main.name, {"M.Pair": 2, "M.Empty": 0}).run()
+
+    def test_known_constructor_fields_and_default(self):
+        for constructed, expected, row in (
+                ("%con M.Pair(66, 65)", 65, "constructor_match"),
+                ("%con M.Empty()", 67, "constructor_default")):
+            body = ("%let v1 = (" + constructed + ") in (%case v1 of { "
+                    "%conalt M.Pair(v2, v3) => Prelude.IO.prim__putChar(v3, v0) "
+                    "Just Prelude.IO.prim__putChar(67, v0) })")
+            expression, rows = self.with_constructors(body)
+            self.assertEqual(expression.value, Call(PUT, (Literal(expected), Var(0))))
+            self.assertEqual(expression.body, Var(expression.variable))
+            self.assertIn(row, [event.realization for event in rows])
+
+    def test_constructor_guards(self):
+        pair = "%let v1 = (%con M.Pair([__], 1)) in ("
+        failures = (
+            ("%con M.Unknown()", "unsupported_constructor"),
+            ("%con M.Pair(1)", "constructor_arity"),
+            (pair + "%case v1 of { %conalt M.Pair(v2) => 1 Nothing })", "constructor_arity"),
+            (pair + "%case v1 of { %conalt M.Pair(v2, v2) => 1 Nothing })", "malformed_constructor_fields"),
+            (pair + "%case v1 of { %conalt M.Empty() => 1| %conalt M.Empty() => 2 Nothing })", "duplicate_constructor_arm"),
+            (pair + "%case v1 of { %conalt M.Empty() => 9 Nothing })", "unmatched_constructor"),
+            ("%case [__] of { %conalt M.Empty() => 9 Nothing }", "unknown_constructor_scrutinee"),
+            (pair + "%case v1 of { %conalt M.Pair(v2, v3) => Prelude.IO.prim__putChar(v2, v0) Nothing })", "observable_erased_value"),
+            (pair + "%op +Int(v1, 1))", "observable_constructor"),
+            (pair + "Prelude.IO.prim__putChar(65, v1))", "observable_constructor"),
+            (pair + "v1)", "escaping_constructor"),
+        )
+        for body, code in failures:
+            with self.subTest(code=code, body=body), self.assertRaises((ArtifactError, UnsupportedError)) as caught:
+                self.with_constructors(body)
+            self.assertEqual(caught.exception.code, code)
+
     def test_exact_compiler_spelling(self):
         self.assertEqual(parse_expression("<OrderedClosure.{main:0} underapp 2>()"),
                          Partial("OrderedClosure.{main:0}", 2, ()))
         self.assertEqual(parse_expression("v2 @ ([__])"), Apply(Var(2), Erased()))
         self.assertEqual(parse_expression("___"), Erased())
+        self.assertEqual(parse_expression("%MkWorld"), Erased())
         self.assertEqual(parse_expression("<M.f underapp 1>(v4, [__])"),
                          Partial("M.f", 1, (Var(4), Erased())))
 
@@ -67,6 +104,7 @@ class KnownClosureTests(unittest.TestCase):
         forward = FunctionDef("M.forward", (0, 1), "", Call(PUT, (Var(0), Var(1))))
         for body in (Call(PUT, (Erased(), Var(0))),
                      Call(PUT, (Var(0), Var(0))),
+                     Call(PUT, (parse_expression("%MkWorld"), Var(0))),
                      Operation("+Int", (Erased(), Literal(1))),
                      ConstCase(Var(0), ((0, Literal(0)),), None),
                      Apply(Erased(), Literal(0)),
