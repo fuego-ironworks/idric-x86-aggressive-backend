@@ -1,0 +1,29 @@
+module ConstructorCallbacks
+
+data Writers = Both (Char → IO ()) (Char → IO ()) | One (Char → IO ()) | Quiet
+
+%noinline
+write_pair : Char → Char → IO ()
+write_pair first second = do
+  putChar first
+  putChar second
+
+%noinline
+write_selected : Writers → IO ()
+write_selected (Both first second) = do
+  second 'Y'
+  first 'B'
+  first 'C'
+write_selected (One writer) = writer 'D'
+write_selected Quiet = putChar '.'
+
+%noinline
+next_marker : Int → Char
+next_marker previous = chr (previous + 1)
+
+main : IO ()
+main = do
+  putChar '!'
+  write_selected (Both (write_pair (next_marker 64)) (write_pair 'X'))
+  write_selected (One (write_pair 'Z'))
+  write_selected Quiet

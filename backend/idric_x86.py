@@ -133,6 +133,20 @@ class ConstCase(Expr):
 
 
 @dataclass(frozen=True)
+class ConstructorArm:
+    name: str
+    fields: tuple[int, ...]
+    body: Expr
+
+
+@dataclass(frozen=True)
+class ConstructorCase(Expr):
+    scrutinee: Expr
+    alternatives: tuple[ConstructorArm, ...]
+    default: Expr | None
+
+
+@dataclass(frozen=True)
 class PlanRow:
     function: str
     item: str
@@ -329,7 +343,7 @@ def parse_expression(source: str) -> Expr:
     while _outer_parentheses(text):
         text = text[1:-1].strip()
 
-    if text in {"[__]", "___"}:
+    if text in {"[__]", "___", "%MkWorld"}:
         return Erased()
     variable = VARIABLE.fullmatch(text)
     if variable:
@@ -381,8 +395,23 @@ def parse_expression(source: str) -> Expr:
             raise ArtifactError("malformed_case", text)
         scrutinee = parse_expression(text[6:marker_at])
         cases_text, default_text = _split_case_default(text[marker_at + len(marker):-2])
+        clauses = _split_top_level(cases_text, "| ")
+        if cases_text.startswith("%conalt "):
+            arms = []
+            for clause in clauses:
+                match = re.match(r"%conalt (.+?)\(([^()]*)\) => ", clause)
+                if match is None:
+                    raise ArtifactError("malformed_constructor_case", clause)
+                name, field_text = match.groups()
+                fields = field_text.split(", ") if field_text else []
+                if any(not VARIABLE.fullmatch(field) for field in fields) or len(set(fields)) != len(fields):
+                    raise ArtifactError("malformed_constructor_fields", clause)
+                arms.append(ConstructorArm(name, tuple(int(field[1:]) for field in fields),
+                                           parse_expression(clause[match.end():])))
+            default = None if default_text is None else parse_expression(default_text)
+            return ConstructorCase(scrutinee, tuple(arms), default)
         alternatives: list[tuple[int, Expr]] = []
-        for alternative in _split_top_level(cases_text, "| "):
+        for alternative in clauses:
             match = re.match(r"%constalt\((-?[0-9]+)\) => ", alternative)
             if not match:
                 raise UnsupportedError("unsupported_case_alternative", alternative)
@@ -468,10 +497,16 @@ def _let_variables(expression: Expr) -> set[int]:
 class KnownClosure:
     target: str
     missing: int
-    captured: tuple[Var | Literal | Erased | KnownClosure, ...]
+    captured: tuple[KnownValue, ...]
 
 
-KnownValue = Var | Literal | Erased | KnownClosure
+@dataclass(frozen=True)
+class KnownConstructor:
+    name: str
+    fields: tuple[KnownValue, ...]
+
+
+KnownValue = Var | Literal | Erased | KnownClosure | KnownConstructor
 Binding = tuple[int, Expr]
 
 
@@ -485,11 +520,15 @@ class KnownClosureSpecializer:
     supported by this deliberately small route.
     """
 
-    def __init__(self, functions: Mapping[str, FunctionDef], entry: str):
+    def __init__(self, functions: Mapping[str, FunctionDef], entry: str,
+                 constructors: Mapping[str, int] | None = None):
         self.functions = functions
+        self.constructors = {} if constructors is None else constructors
         self.entry = entry
         self.next_variable = max(functions[entry].arguments, default=-1) + 1
-        self.world = Var(functions[entry].arguments[0])
+        arguments = functions[entry].arguments
+        # Used only as putChar's unused native-world operand.
+        self.world = Var(arguments[0]) if arguments else Literal(0)
         self.active: list[str] = []
         self.rows: list[PlanRow] = []
         self.changed = False
@@ -500,6 +539,8 @@ class KnownClosureSpecializer:
     def scalar(value: KnownValue, where: str) -> Var | Literal:
         if isinstance(value, Erased):
             raise UnsupportedError("observable_erased_value", where)
+        if isinstance(value, KnownConstructor):
+            raise UnsupportedError("observable_constructor", where)
         if not isinstance(value, (Var, Literal)):
             raise UnsupportedError("observable_closure_value", where)
         return value
@@ -521,6 +562,12 @@ class KnownClosureSpecializer:
             result = Let(number, value, result)
         return result
 
+    def check_constructor(self, name: str, count: int) -> None:
+        if name not in self.constructors:
+            raise UnsupportedError("unsupported_constructor", name)
+        if self.constructors[name] != count:
+            raise ArtifactError("constructor_arity", f"{name}: expected {self.constructors[name]}, got {count}")
+
     def arity(self, target: str) -> int:
         if target == "Prelude.IO.prim__putChar":
             return 2
@@ -532,6 +579,12 @@ class KnownClosureSpecializer:
 
     def call(self, target: str, arguments: tuple[KnownValue, ...],
              bindings: list[Binding]) -> KnownValue:
+        if target.startswith("%con "):
+            name = target[5:]
+            self.check_constructor(name, len(arguments))
+            self.changed = True
+            self.rows.append(PlanRow(self.active[-1], name, "known_constructor", f"fields={len(arguments)}"))
+            return KnownConstructor(name, arguments)
         arity = self.arity(target)
         if len(arguments) != arity:
             code = "putchar_arity" if target == "Prelude.IO.prim__putChar" else "call_arity"
@@ -541,6 +594,8 @@ class KnownClosureSpecializer:
             # The world slot is not observable by this particular native
             # primitive. Erased arguments are never replaced by zero as data.
             world = arguments[1]
+            if isinstance(world, KnownConstructor):
+                raise UnsupportedError("observable_constructor", target + " world")
             if isinstance(world, KnownClosure):
                 raise UnsupportedError("observable_closure_value", target + " world")
             return self.bind(bindings, Call(target, (byte, self.world)))
@@ -621,6 +676,28 @@ class KnownClosureSpecializer:
             self.rows.append(PlanRow(where, closure.target, "closure_saturated",
                                      "exact named body; ordered arguments"))
             return self.call(closure.target, captured, bindings)
+        if isinstance(expression, ConstructorCase):
+            self.require_atoms((expression.scrutinee,), where + " constructor case")
+            value = self.evaluate(expression.scrutinee, environment, bindings, where)
+            if not isinstance(value, KnownConstructor):
+                raise UnsupportedError("unknown_constructor_scrutinee", where)
+            by_name = {}
+            for arm in expression.alternatives:
+                self.check_constructor(arm.name, len(arm.fields))
+                if arm.name in by_name:
+                    raise ArtifactError("duplicate_constructor_arm", arm.name)
+                by_name[arm.name] = arm
+            self.changed = True
+            if value.name in by_name:
+                arm = by_name[value.name]
+                bound = dict(environment)
+                bound.update(zip(arm.fields, value.fields))
+                self.rows.append(PlanRow(where, value.name, "constructor_match", f"fields={len(arm.fields)}"))
+                return self.evaluate(arm.body, bound, bindings, where)
+            if expression.default is None:
+                raise UnsupportedError("unmatched_constructor", value.name)
+            self.rows.append(PlanRow(where, value.name, "constructor_default", "known nonmatching alternative"))
+            return self.evaluate(expression.default, environment, bindings, where)
         if isinstance(expression, ConstCase):
             self.require_atoms((expression.scrutinee,), where + " case")
             scrutinee = self.scalar(self.evaluate(expression.scrutinee, environment, bindings, where),
@@ -655,7 +732,9 @@ class KnownClosureSpecializer:
 
     def run(self) -> tuple[Expr, tuple[PlanRow, ...]] | None:
         bindings: list[Binding] = []
-        result = self.call(self.entry, (Erased(),), bindings)
+        result = self.call(self.entry, tuple(Erased() for _ in self.functions[self.entry].arguments), bindings)
+        if isinstance(result, KnownConstructor):
+            raise UnsupportedError("escaping_constructor", self.entry)
         if isinstance(result, KnownClosure):
             raise UnsupportedError("escaping_closure", self.entry)
         if isinstance(result, Erased):
@@ -766,9 +845,7 @@ class ExactRangeProof:
 
     def check(self, entry: str) -> None:
         function = self.functions[entry]
-        if len(function.arguments) != 1:
-            raise UnsupportedError("entry_arity", f"{entry}: expected erased world argument")
-        self.call(entry, [0])
+        self.call(entry, [0] * len(function.arguments))
 
 
 class Assembler:
@@ -1142,9 +1219,21 @@ class Lowerer:
 def make_scalar_plan(artifact: CheckedArtifact) -> tuple[dict[str, FunctionDef], str]:
     functions = parse_functions(artifact)
     entry = _main_name(functions)
-    if len(functions[entry].arguments) != 1:
+    if not functions[entry].arguments:
+        # A zero-argument main returns an IO action. The generated process
+        # entry supplies the world and applies that action through ordinary ANF.
+        wrapper = "{__mainExpression:0}"
+        if wrapper not in functions or functions[wrapper].arguments:
+            raise UnsupportedError("entry_arity", f"{entry}: missing zero-argument process entry")
+        entry = wrapper
+    elif len(functions[entry].arguments) != 1:
         raise UnsupportedError("entry_arity", f"{entry}: expected erased world argument")
-    specialized = KnownClosureSpecializer(functions, entry).run()
+    constructors: dict[str, int] = {}
+    for name, definition in artifact.definitions:
+        match = re.fullmatch(r"Constructor tag (?:Just [0-9]+|Nothing) arity ([0-9]+) newtype by Nothing", definition)
+        if match:
+            constructors[name] = int(match[1])
+    specialized = KnownClosureSpecializer(functions, entry, constructors).run()
     if specialized is not None:
         expression, rows = specialized
         original = functions[entry]
