@@ -59,7 +59,8 @@ class ProcessArgumentTests(unittest.TestCase):
     def test_argv_zero_and_literal_bytes(self):
         for literal in ("", "é", "program"):
             with self.subTest(literal=literal):
-                compiled = build("%let v1 = (M.arg(0, v0)) in ("
+                index = 0 if literal else 1
+                compiled = build(f"%let v1 = (M.arg({index}, v0)) in ("
                                  f'%let v2 = (%op ==String("{literal}", v1)) in ('
                                  "%case v2 of { %constalt(1) => Prelude.IO.prim__putChar(89, v0) "
                                  "Just Prelude.IO.prim__putChar(78, v0) }))")
@@ -68,5 +69,6 @@ class ProcessArgumentTests(unittest.TestCase):
                     path.write_bytes(compiled.elf)
                     path.chmod(0o755)
                     for name, expected in ((literal, b"Y"), (literal + "x", b"N")):
-                        run = subprocess.run([name], executable=path, capture_output=True)
+                        argv = [name] if index == 0 else ["program", name]
+                        run = subprocess.run(argv, executable=path, capture_output=True)
                         self.assertEqual((run.returncode, run.stdout, run.stderr), (0, expected, b""))
