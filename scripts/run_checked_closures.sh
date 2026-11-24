@@ -31,6 +31,7 @@ old=$(mktemp -d)
 trap 'git worktree remove --force "$old" >/dev/null 2>&1 || true; rmdir "$old" 2>/dev/null || true' EXIT
 git worktree add --detach "$old" "$baseline"
 status=0
+PYTHONPATH="$root" python3 scripts/check_process_arguments.py "$compiler_repo" "$out/process-arguments" || status=1
 while read -r name expected; do
   source="$root/fixtures/closures/$name.idric"
   if ! python3 -m backend.idric_x86 "$out/$name.one-step" --source "$source" \
@@ -121,7 +122,7 @@ for target in linux-x86_64 netbsd-x86_64; do
   if ! grep -F $'result\tREJECTED\tunsupported_one_step_expression\t[__]' "$before"; then
     echo "Unexpected baseline file frontier: $target" >&2; status=1
   fi
-  if ! grep -Fx $'result\tREJECTED\tunsupported_call\tSystem.prim__getArgCount' "$after" &&
+  if ! grep -Fx $'result\tREJECTED\trecursive_call\tBinaryFilePrefix.main -> {{csegen:13}:0} -> System.{getArgs:17} -> Prelude.Types.rangeFromTo -> Prelude.Types.takeUntil -> Prelude.Types.takeUntil' "$after" &&
      ! grep -q $'^result\tCOMPILED_NOT_RUN\t' "$after"; then
     echo "Unexpected file frontier after dictionary application: $target" >&2; status=1
   fi
