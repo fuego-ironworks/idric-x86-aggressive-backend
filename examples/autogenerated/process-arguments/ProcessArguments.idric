@@ -1,0 +1,21 @@
+module ProcessArguments
+
+%foreign "scheme:blodwen-arg-count"
+         "C:idris2_getArgCount, libidris2_support, idris_support.h"
+         "node:lambda:() => process.argv.length - 1"
+argument_count : PrimIO Int
+
+%foreign "scheme:blodwen-arg"
+         "C:idris2_getArg, libidris2_support, idris_support.h"
+         "node:lambda:n => process.argv[n + 1]"
+argument_at : Int → PrimIO String
+
+main : IO ()
+main = do
+  putChar '!'
+  count ← primIO argument_count
+  if count == 3
+    then do
+      name ← primIO (argument_at 2)
+      if name == "zebra" then putChar 'Y' else putChar 'N'
+    else putChar '-'

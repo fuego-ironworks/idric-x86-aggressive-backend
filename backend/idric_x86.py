@@ -79,6 +79,37 @@ class Expr:
 
 
 @dataclass(frozen=True)
+class ArgumentCount(Expr):
+    pass
+
+
+@dataclass(frozen=True)
+class ArgumentAt(Expr):
+    index: Expr
+
+
+@dataclass(frozen=True)
+class ArgumentEquals(Expr):
+    address: Var
+    literal: bytes
+
+
+@dataclass(frozen=True)
+class TextLiteral(Expr):
+    data: bytes
+
+
+# Match the complete compiler-owned foreign declaration, including its ABI.
+# A user declaration of the same binding may have a different qualified name.
+ARGUMENT_COUNT_FFI = ('Foreign call ["scheme:blodwen-arg-count", '
+                      '"C:idris2_getArgCount, libidris2_support, idris_support.h", '
+                      '"node:lambda:() => process.argv.length - 1"] [%World] -> IORes Int')
+ARGUMENT_AT_FFI = ('Foreign call ["scheme:blodwen-arg", '
+                   '"C:idris2_getArg, libidris2_support, idris_support.h", '
+                   '"node:lambda:n => process.argv[n + 1]"] [Int, %World] -> IORes String')
+
+
+@dataclass(frozen=True)
 class Var(Expr):
     number: int
 
@@ -353,6 +384,11 @@ def parse_expression(source: str) -> Expr:
         if not I64_MIN <= value <= I64_MAX:
             raise UnsupportedError("integer_out_of_range", text)
         return Literal(value)
+    if text.startswith('"'):
+        # Leave escaped ANF spellings to a future full string decoder.
+        if not re.fullmatch(r'"[^"\\\x00-\x1f]*"', text):
+            raise UnsupportedError("unsupported_string_literal", text)
+        return TextLiteral(text[1:-1].encode("utf-8"))
     if text.startswith("'"):
         try:
             value = ast.literal_eval(text)
@@ -506,7 +542,12 @@ class KnownConstructor:
     fields: tuple[KnownValue, ...]
 
 
-KnownValue = Var | Literal | Erased | KnownClosure | KnownConstructor
+@dataclass(frozen=True)
+class KnownArgument:
+    address: Var
+
+
+KnownValue = Var | Literal | Erased | KnownClosure | KnownConstructor | KnownArgument | TextLiteral
 Binding = tuple[int, Expr]
 
 
@@ -521,9 +562,11 @@ class KnownClosureSpecializer:
     """
 
     def __init__(self, functions: Mapping[str, FunctionDef], entry: str,
-                 constructors: Mapping[str, int] | None = None):
+                 constructors: Mapping[str, int] | None = None,
+                 argument_primitives: Mapping[str, str] | None = None):
         self.functions = functions
         self.constructors = {} if constructors is None else constructors
+        self.argument_primitives = argument_primitives or {}
         self.entry = entry
         self.next_variable = max(functions[entry].arguments, default=-1) + 1
         arguments = functions[entry].arguments
@@ -539,6 +582,8 @@ class KnownClosureSpecializer:
     def scalar(value: KnownValue, where: str) -> Var | Literal:
         if isinstance(value, Erased):
             raise UnsupportedError("observable_erased_value", where)
+        if isinstance(value, (KnownArgument, TextLiteral)):
+            raise UnsupportedError("string_as_scalar", where)
         if isinstance(value, KnownConstructor):
             raise UnsupportedError("observable_constructor", where)
         if not isinstance(value, (Var, Literal)):
@@ -547,7 +592,7 @@ class KnownClosureSpecializer:
 
     @staticmethod
     def require_atoms(arguments: Sequence[Expr], where: str) -> None:
-        if any(not isinstance(argument, (Var, Literal, Erased)) for argument in arguments):
+        if any(not isinstance(argument, (Var, Literal, Erased, TextLiteral)) for argument in arguments):
             raise UnsupportedError("non_atomic_operand", where)
 
     def bind(self, bindings: list[Binding], expression: Expr) -> Var:
@@ -569,6 +614,8 @@ class KnownClosureSpecializer:
             raise ArtifactError("constructor_arity", f"{name}: expected {self.constructors[name]}, got {count}")
 
     def arity(self, target: str) -> int:
+        if target in self.argument_primitives:
+            return 1 if self.argument_primitives[target] == ARGUMENT_COUNT_FFI else 2
         if target == "Prelude.IO.prim__putChar":
             return 2
         if target not in self.functions:
@@ -589,11 +636,22 @@ class KnownClosureSpecializer:
         if len(arguments) != arity:
             code = "putchar_arity" if target == "Prelude.IO.prim__putChar" else "call_arity"
             raise ArtifactError(code, f"{target}: {len(arguments)} vs {arity}")
+        if target in self.argument_primitives:
+            if not isinstance(arguments[-1], (Erased, Literal, Var)):
+                raise UnsupportedError("invalid_world_argument", target)
+            self.changed = True
+            self.rows.append(PlanRow(self.active[-1], target, "process_argument", "original process stack"))
+            if self.argument_primitives[target] == ARGUMENT_COUNT_FFI:
+                return self.bind(bindings, ArgumentCount())
+            index = self.scalar(arguments[0], target + " index")
+            return KnownArgument(self.bind(bindings, ArgumentAt(index)))
         if target == "Prelude.IO.prim__putChar":
             byte = self.scalar(arguments[0], target + " character")
             # The world slot is not observable by this particular native
             # primitive. Erased arguments are never replaced by zero as data.
             world = arguments[1]
+            if isinstance(world, (KnownArgument, TextLiteral)):
+                raise UnsupportedError("invalid_world_argument", target)
             if isinstance(world, KnownConstructor):
                 raise UnsupportedError("observable_constructor", target + " world")
             if isinstance(world, KnownClosure):
@@ -619,6 +677,9 @@ class KnownClosureSpecializer:
         self.budget -= 1
         if self.budget < 0:
             raise UnsupportedError("specialization_budget", where)
+        if isinstance(expression, TextLiteral):
+            self.changed = True
+            return expression
         if isinstance(expression, Literal):
             return expression
         if isinstance(expression, Erased):
@@ -635,9 +696,15 @@ class KnownClosureSpecializer:
             return self.evaluate(expression.body, extended, bindings, where)
         if isinstance(expression, Operation):
             self.require_atoms(expression.arguments, expression.name)
-            arguments = tuple(self.scalar(self.evaluate(item, environment, bindings, where),
-                                          where + " " + expression.name)
-                              for item in expression.arguments)
+            values = tuple(self.evaluate(item, environment, bindings, where) for item in expression.arguments)
+            if expression.name == "==String" and len(values) == 2:
+                left, right = values
+                if isinstance(left, TextLiteral):
+                    left, right = right, left
+                if not isinstance(left, KnownArgument) or not isinstance(right, TextLiteral):
+                    raise UnsupportedError("unsupported_string_comparison", where)
+                return self.bind(bindings, ArgumentEquals(left.address, right.data))
+            arguments = tuple(self.scalar(value, where + " " + expression.name) for value in values)
             return self.bind(bindings, Operation(expression.name, arguments))
         if isinstance(expression, Call):
             self.require_atoms(expression.arguments, expression.name)
@@ -733,6 +800,8 @@ class KnownClosureSpecializer:
     def run(self) -> tuple[Expr, tuple[PlanRow, ...]] | None:
         bindings: list[Binding] = []
         result = self.call(self.entry, tuple(Erased() for _ in self.functions[self.entry].arguments), bindings)
+        if isinstance(result, (KnownArgument, TextLiteral)):
+            raise UnsupportedError("escaping_string", self.entry)
         if isinstance(result, KnownConstructor):
             raise UnsupportedError("escaping_constructor", self.entry)
         if isinstance(result, KnownClosure):
@@ -747,12 +816,21 @@ class KnownClosureSpecializer:
         return expression, tuple(self.rows)
 
 
+@dataclass(frozen=True)
+class IntRange:
+    low: int
+    high: int
+
+
+# None denotes a typed argv string address. Only a string operation may use it.
+ProofValue = IntRange | None
+
+
 class ExactRangeProof:
     """Prove the deliberately bounded scalar route before emitting machine code.
 
-    The proof evaluates compiler expressions only to establish that every
-    reachable scalar stays in signed i64 and every putChar observation is one
-    byte.  Lowering still emits the original arithmetic, comparisons, branches,
+    The proof tracks intervals, including exact constants, to establish that
+    every reachable scalar fits signed i64 and each putChar fits one byte.  Lowering still emits the original arithmetic, comparisons, branches,
     and calls; no proved result is substituted into the executable.
     """
 
@@ -761,14 +839,32 @@ class ExactRangeProof:
         self.active: list[str] = []
 
     @staticmethod
-    def bounded(value: int, where: str) -> int:
-        if not I64_MIN <= value <= I64_MAX:
-            raise UnsupportedError("unproved_integer_range", f"{where}: {value}")
+    def bounded(low: int, high: int, where: str) -> IntRange:
+        if low < I64_MIN or high > I64_MAX:
+            raise UnsupportedError("unproved_integer_range", f"{where}: [{low}, {high}]")
+        return IntRange(low, high)
+
+    @staticmethod
+    def scalar(value: ProofValue, where: str) -> IntRange:
+        if value is None:
+            raise UnsupportedError("string_as_scalar", where)
         return value
 
-    def expression(self, expression: Expr, environment: Mapping[int, int], where: str) -> int:
+    def expression(self, expression: Expr, environment: Mapping[int, ProofValue], where: str) -> ProofValue:
+        def scalar(item: Expr) -> IntRange:
+            return self.scalar(self.expression(item, environment, where), where)
+
         if isinstance(expression, Literal):
-            return self.bounded(expression.value, where)
+            return self.bounded(expression.value, expression.value, where)
+        if isinstance(expression, ArgumentCount):
+            return IntRange(0, I64_MAX)
+        if isinstance(expression, ArgumentAt):
+            scalar(expression.index)
+            return None  # Index bounds are checked at the actual use.
+        if isinstance(expression, ArgumentEquals):
+            if self.expression(expression.address, environment, where) is not None:
+                raise UnsupportedError("expected_argument_string", where)
+            return IntRange(0, 1)
         if isinstance(expression, Var):
             if expression.number not in environment:
                 raise UnsupportedError("unproved_runtime_value", f"{where}: v{expression.number}")
@@ -779,55 +875,58 @@ class ExactRangeProof:
             extended[expression.variable] = value
             return self.expression(expression.body, extended, where)
         if isinstance(expression, Operation):
-            arguments = [self.expression(item, environment, where)
-                         for item in expression.arguments]
-            if expression.name in {"cast-Integer-Int"} and len(arguments) == 1:
-                return self.bounded(arguments[0], where)
+            arguments = [scalar(item) for item in expression.arguments]
+            if expression.name == "cast-Integer-Int" and len(arguments) == 1:
+                return arguments[0]
             if expression.name in {"cast-Int-Char", "cast-Integer-Char"} and len(arguments) == 1:
                 value = arguments[0]
-                if not 0 <= value <= 255:
+                if value.low < 0 or value.high > 255:
                     raise UnsupportedError("putchar_not_one_byte", f"{where}: {value}")
                 return value
-            arithmetic = {
-                "+Int": lambda left, right: left + right,
-                "+Integer": lambda left, right: left + right,
-                "-Int": lambda left, right: left - right,
-                "-Integer": lambda left, right: left - right,
-                "*Int": lambda left, right: left * right,
-                "*Integer": lambda left, right: left * right,
-            }
-            if expression.name in arithmetic and len(arguments) == 2:
-                return self.bounded(arithmetic[expression.name](*arguments), where)
-            comparisons = {"<Int", "<Integer", "<=Int", "<=Integer", "==Int", "==Integer"}
-            if expression.name in comparisons and len(arguments) == 2:
+            if len(arguments) == 2:
                 left, right = arguments
-                if expression.name.startswith("<Integer") or expression.name.startswith("<Int"):
-                    return int(left < right)
-                if expression.name.startswith("<="):
-                    return int(left <= right)
-                return int(left == right)
+                if expression.name in {"+Int", "+Integer"}:
+                    return self.bounded(left.low + right.low, left.high + right.high, where)
+                if expression.name in {"-Int", "-Integer"}:
+                    return self.bounded(left.low - right.high, left.high - right.low, where)
+                if expression.name in {"*Int", "*Integer"}:
+                    products = [x * y for x in (left.low, left.high) for y in (right.low, right.high)]
+                    return self.bounded(min(products), max(products), where)
+                if expression.name in {"<Int", "<Integer"}:
+                    return IntRange(int(left.high < right.low), int(left.low < right.high))
+                if expression.name in {"<=Int", "<=Integer"}:
+                    return IntRange(int(left.high <= right.low), int(left.low <= right.high))
+                if expression.name in {"==Int", "==Integer"}:
+                    equal = left.low == left.high == right.low == right.high
+                    overlap = left.low <= right.high and right.low <= left.high
+                    return IntRange(int(equal), int(overlap))
             raise UnsupportedError("unsupported_operation", expression.name)
         if isinstance(expression, Call):
-            arguments = [self.expression(item, environment, where)
-                         for item in expression.arguments]
+            arguments = [self.expression(item, environment, where) for item in expression.arguments]
             if expression.name == "Prelude.IO.prim__putChar":
                 if len(arguments) != 2:
                     raise ArtifactError("putchar_arity", str(len(arguments)))
-                if not 0 <= arguments[0] <= 255:
-                    raise UnsupportedError("putchar_not_one_byte", f"{where}: {arguments[0]}")
-                return 0
+                byte = self.scalar(arguments[0], where)
+                if byte.low < 0 or byte.high > 255:
+                    raise UnsupportedError("putchar_not_one_byte", f"{where}: {byte}")
+                return IntRange(0, 0)
             return self.call(expression.name, arguments)
         if isinstance(expression, ConstCase):
-            scrutinee = self.expression(expression.scrutinee, environment, where)
+            test = scalar(expression.scrutinee)
+            covered = set()
+            results = []
             for constant, alternative in expression.alternatives:
-                if scrutinee == constant:
-                    return self.expression(alternative, environment, where)
-            if expression.default is None:
-                raise UnsupportedError("unreachable_case_reached", f"{where}: {scrutinee}")
-            return self.expression(expression.default, environment, where)
+                if test.low <= constant <= test.high and constant not in covered:
+                    covered.add(constant)
+                    results.append(scalar(alternative))
+            if len(covered) < test.high - test.low + 1:
+                if expression.default is None:
+                    raise UnsupportedError("unreachable_case_reached", f"{where}: {test}")
+                results.append(scalar(expression.default))
+            return IntRange(min(v.low for v in results), max(v.high for v in results))
         raise AssertionError(type(expression))
 
-    def call(self, name: str, arguments: Sequence[int]) -> int:
+    def call(self, name: str, arguments: Sequence[ProofValue]) -> ProofValue:
         if name not in self.functions:
             raise UnsupportedError("unsupported_call", name)
         function = self.functions[name]
@@ -845,7 +944,7 @@ class ExactRangeProof:
 
     def check(self, entry: str) -> None:
         function = self.functions[entry]
-        self.call(entry, [0] * len(function.arguments))
+        self.call(entry, [IntRange(0, 0)] * len(function.arguments))
 
 
 class Assembler:
@@ -986,6 +1085,8 @@ class Lowerer:
         self.case_number = 0
         self.write_count = 0
         self.needs_write_failure = False
+        self.needs_argument_failure = False
+        self.argument_literals: dict[bytes, str] = {}
 
     @staticmethod
     def require_atoms(arguments: Sequence[Expr], where: str) -> None:
@@ -1025,6 +1126,41 @@ class Lowerer:
 
     def emit_expression(self, frame: Frame, expression: Expr) -> None:
         function = frame.function.name
+        if isinstance(expression, ArgumentCount):
+            self.assembler.emit(b"\x49\x8b\x04\x24", "mov rax, [r12] ; argc")
+            return
+        if isinstance(expression, ArgumentAt):
+            self.load(frame, expression.index)
+            self.assembler.emit(b"\x49\x3b\x04\x24", "cmp rax, [r12] ; unsigned index against argc")
+            self.assembler.rel32(b"\x0f\x83", "process:invalid_argument", "jae process:invalid_argument")
+            self.needs_argument_failure = True
+            self.assembler.emit(b"\x49\x8b\x44\xc4\x08", "mov rax, [r12 + rax*8 + 8] ; argv[index]")
+            return
+        if isinstance(expression, ArgumentEquals):
+            self.load(frame, expression.address)
+            number = self.case_number
+            self.case_number += 1
+            unequal, done = f"string:{number}:different", f"string:{number}:done"
+            literal_label = self.argument_literals.setdefault(
+                expression.literal, f"argument:literal:{len(self.argument_literals)}")
+            loop, equal = f"string:{number}:compare", f"string:{number}:equal"
+            self.assembler.rel32(b"\x4c\x8d\x1d", literal_label, f"lea r11, [rip + {literal_label}]")
+            self.assembler.label(loop)
+            self.assembler.emit(b"\x8a\x10", "mov dl, [rax]")
+            self.assembler.emit(b"\x41\x3a\x13", "cmp dl, [r11]")
+            self.assembler.rel32(b"\x0f\x85", unequal, f"jne {unequal}")
+            self.assembler.emit(b"\x84\xd2", "test dl, dl ; both strings terminated")
+            self.assembler.rel32(b"\x0f\x84", equal, f"je {equal}")
+            self.assembler.emit(b"\x48\xff\xc0", "inc rax")
+            self.assembler.emit(b"\x49\xff\xc3", "inc r11")
+            self.assembler.rel32(b"\xe9", loop, f"jmp {loop}")
+            self.assembler.label(equal)
+            self.assembler.emit(_mov_immediate(RAX, 1), "mov rax, 1 ; equal")
+            self.assembler.rel32(b"\xe9", done, f"jmp {done}")
+            self.assembler.label(unequal)
+            self.assembler.emit(_xor_register(RAX), "xor rax, rax ; different")
+            self.assembler.label(done)
+            return
         if isinstance(expression, (Var, Literal)):
             self.load(frame, expression)
             return
@@ -1170,6 +1306,10 @@ class Lowerer:
         frame = self.frame(function, entry=entry)
         self.compiled.add(name)
         self.assembler.label("_start" if entry else f"function:{name}")
+        if entry and any(row.realization == "process_argument" for row in function.specialization_rows):
+            # The kernel's original stack owns argc and argv for the lifetime of the process.
+            # r12 is reserved here and is preserved across our helpers and syscalls.
+            self.assembler.emit(_mov_register(12, RSP), "mov r12, rsp ; save initial process stack")
         self.assembler.emit(_stack_adjust(True, frame.size),
                             f"sub rsp, {frame.size} ; aligned frame for {name}")
         if len(function.arguments) > len(ARGUMENT_REGISTERS) and not entry:
@@ -1202,6 +1342,12 @@ class Lowerer:
             self.emit_function(self.pending.pop(0), entry=False)
         if self.write_count == 0:
             raise UnsupportedError("no_observable_output", "supported baseline requires checked putChar")
+        if self.needs_argument_failure:
+            self.assembler.label("process:invalid_argument")
+            self.assembler.emit(_mov_immediate(RDI, 2), "mov rdi, 2 ; argument index out of bounds")
+            exit_number = 1 if self.target == "netbsd-x86_64" else 60
+            self.assembler.emit(_mov_immediate(RAX, exit_number), f"mov rax, {exit_number} ; SYS_exit")
+            self.assembler.emit(b"\x0f\x05", "syscall ; exit after invalid argument index")
         if self.needs_write_failure:
             self.assembler.label("process:write_failure")
             self.assembler.emit(_mov_immediate(RDI, 1), "mov rdi, 1 ; write failure status")
@@ -1209,6 +1355,9 @@ class Lowerer:
             self.assembler.emit(_mov_immediate(RAX, exit_number),
                                 f"mov rax, {exit_number} ; SYS_exit")
             self.assembler.emit(b"\x0f\x05", "syscall ; exit after write failure")
+        for literal, label in self.argument_literals.items():
+            self.assembler.label(label)
+            self.assembler.emit(literal + b"\0", f"UTF-8 string literal, {len(literal)} bytes and NUL")
         machine, instruction_listing = self.assembler.finish()
         selected = tuple(self.functions[name] for name in sorted(self.compiled))
         plan = ScalarPlan(self.artifact, entry, selected, tuple(self.rows))
@@ -1233,7 +1382,9 @@ def make_scalar_plan(artifact: CheckedArtifact) -> tuple[dict[str, FunctionDef],
         match = re.fullmatch(r"Constructor tag (?:Just [0-9]+|Nothing) arity ([0-9]+) newtype by Nothing", definition)
         if match:
             constructors[name] = int(match[1])
-    specialized = KnownClosureSpecializer(functions, entry, constructors).run()
+    primitives = {name: definition for name, definition in artifact.definitions
+                  if definition in (ARGUMENT_COUNT_FFI, ARGUMENT_AT_FFI)}
+    specialized = KnownClosureSpecializer(functions, entry, constructors, primitives).run()
     if specialized is not None:
         expression, rows = specialized
         original = functions[entry]
